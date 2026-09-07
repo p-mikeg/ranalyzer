@@ -99,12 +99,21 @@ impl<R: rsleigh::MemReader> FunctionLifter<'_, R> {
             }
             // A STORE into the REGISTER space writes a register, not memory:
             // the sla addresses one that way when an instruction field picks
-            // it (ARM `vld1.N {dX[i]}`). Mirrors `handle_store`, which fails
-            // the lift when the same address does not fold, so a def is
-            // recorded exactly when one is written.
+            // it (ARM `vld1.N {dX[i]}`). Mirrors `handle_store` on both of its
+            // paths -- the named register when the address resolves, and the
+            // whole register file when it does not -- so a def is recorded for
+            // exactly what is written.
             Opcode::Store => {
-                if let Some(vn) = super::pcode_consts::register_store_target(insn, consts) {
+                let declared = self.lifter.declared_reg_vns();
+                if let Some(vn) = super::pcode_consts::register_store_target(insn, consts, declared)
+                {
                     self.add_def(&vn, r, defs);
+                } else if super::pcode_consts::is_register_space_access(insn) {
+                    for vn in
+                        super::pcode_consts::opaque_clobber_set(self.builder.function().all_vns())
+                    {
+                        self.add_def(&vn, r, defs);
+                    }
                 }
             }
             // Write no tracked variable.

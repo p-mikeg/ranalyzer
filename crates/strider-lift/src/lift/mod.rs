@@ -57,6 +57,9 @@ pub struct Lifter<R: rsleigh::MemReader> {
     sleigh: rsleigh::Sleigh<R>,
     /// Cached at construction: `Sleigh::regs()` is expensive.
     sleigh_regs: rsleigh::SleighRegs,
+    /// The declared register file as a slice, for the per-op containment
+    /// queries in [`pcode_consts`]. `SleighRegs` only hands out an iterator.
+    declared_reg_vns: Vec<rsleigh::Vn>,
     user_op_names: Vec<String>,
     /// Flowing context vars, discovered once (constant per sla) and lent to
     /// every `build_cfg` so decode mode propagates along CFG edges.
@@ -74,6 +77,7 @@ pub struct Lifter<R: rsleigh::MemReader> {
 impl<R: rsleigh::MemReader> Lifter<R> {
     pub fn new(arch: strider_target::SleighArch, sleigh: rsleigh::Sleigh<R>) -> Result<Self> {
         let sleigh_regs = sleigh.regs()?;
+        let declared_reg_vns = sleigh_regs.vns().collect();
         let user_op_names = sleigh.user_op_names().unwrap_or_default();
         let flow_vars = strider_cfg::FlowVars::discover(&sleigh)?;
         // Read on the still-fresh engine, so this is the pspec default, not a
@@ -89,6 +93,7 @@ impl<R: rsleigh::MemReader> Lifter<R> {
             arch,
             sleigh,
             sleigh_regs,
+            declared_reg_vns,
             user_op_names,
             flow_vars,
             entry_defaults,
@@ -115,6 +120,13 @@ impl<R: rsleigh::MemReader> Lifter<R> {
     #[must_use]
     pub fn sleigh_regs(&self) -> &rsleigh::SleighRegs {
         &self.sleigh_regs
+    }
+
+    /// The declared register file, for containment queries against a computed
+    /// REGISTER-space address.
+    #[must_use]
+    pub fn declared_reg_vns(&self) -> &[rsleigh::Vn] {
+        &self.declared_reg_vns
     }
 
     /// `per_address_ccs` supplies CC overrides for call TARGETS.  Pass an
@@ -191,24 +203,31 @@ impl<R: rsleigh::MemReader> Lifter<R> {
     /// the universe, `write_vn` has nothing to write, and the lift fails on a
     /// function that used to (wrongly) lift the write as memory.
     ///
-    /// Silent about an address that does not fold: that is the lift's error to
-    /// raise, against the op, where it can say so.
+    /// Silent about an address that does not resolve: the lift takes its
+    /// opaque path there, which clobbers registers already in the set.
+    ///
+    /// The ENCLOSING declared register is seeded, not the resolved slice. A
+    /// computed offset need not land on a declared boundary, and seeding a
+    /// partially-overlapping slice would break the nesting the tracked set
+    /// relies on -- see [`pcode_consts::register_slot`].
     fn register_space_vns(&self, cfg: &strider_cfg::Cfg) -> Vec<rsleigh::Vn> {
+        let declared = self.declared_reg_vns();
         let mut found: rustc_hash::FxHashSet<rsleigh::Vn> = rustc_hash::FxHashSet::default();
         for region in cfg.regions() {
             let mut consts = pcode_consts::PcodeConsts::default();
             for wrapped in &region.insns {
                 consts.observe(wrapped.addr, &wrapped.insn);
-                let vn = match wrapped.insn.opcode {
+                let slot = match wrapped.insn.opcode {
                     rsleigh::Opcode::Store => {
-                        pcode_consts::register_store_target(&wrapped.insn, &consts)
+                        pcode_consts::register_store_target(&wrapped.insn, &consts, declared)
                     }
                     rsleigh::Opcode::Load => {
-                        pcode_consts::register_load_source(&wrapped.insn, &consts)
+                        pcode_consts::register_load_source(&wrapped.insn, &consts, declared)
                     }
                     _ => None,
                 };
-                if let Some(vn) = vn {
+                if let Some(vn) = slot.and_then(|s| pcode_consts::enclosing_register(declared, &s))
+                {
                     found.insert(vn);
                 }
             }

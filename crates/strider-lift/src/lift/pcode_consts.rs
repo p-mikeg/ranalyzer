@@ -3,14 +3,20 @@
 //! A sla may address a REGISTER through the LOAD / STORE opcodes when the
 //! register is chosen by an instruction field rather than named outright --
 //! ARM's `vld1.N {dX[i]}, [addr]` writes lane `i` of `dX` that way. The address
-//! is then a small expression over constants the decoder substituted, so it
-//! folds; nothing runtime reaches it.
+//! is then a small expression over constants the decoder substituted.
+//!
+//! It does not always fold. ARM's multi-structure `VLD2/3/4` and `VST2/3/4`
+//! build the same shape but walk it with an INTRA-INSTRUCTION loop, so the
+//! pointer is loop-carried and the CFG splits the one machine instruction
+//! across regions -- and this resets at every region boundary, which puts the
+//! definition and the use on opposite sides. The lift takes an opaque path
+//! there; see `memory::opaque_register_store`.
 //!
 //! Both the def-site collection and the lift walk `region.insns` in the same
 //! order and feed every op through one of these, so the varnode they resolve
-//! for a given store is the same one. That agreement is load-bearing: a lift
-//! that writes a variable whose def site was never recorded gets no phi at a
-//! join, which is a worse answer than the memory store this replaces.
+//! for a given store is the same one, and they agree on which stores resolve
+//! at all. That agreement is load-bearing: a lift that writes a variable whose
+//! def site was never recorded gets no phi at a join.
 
 use rustc_hash::FxHashMap;
 
@@ -111,14 +117,15 @@ fn mask_to(v: u128, size_bytes: u32) -> u128 {
 }
 
 /// The register a STORE writes, when it addresses the REGISTER space and its
-/// address folds. `None` for an ordinary memory store, and for a register
-/// store whose address does not fold -- the lift fails closed on that second
+/// address resolves. `None` for an ordinary memory store, and for a register
+/// store this cannot name -- the lift takes its opaque path on that second
 /// case rather than writing the wrong register.
 pub(crate) fn register_store_target(
     insn: &rsleigh::Insn,
     consts: &PcodeConsts,
+    declared: &[rsleigh::Vn],
 ) -> Option<rsleigh::Vn> {
-    register_slot(insn, consts, insn.inputs.get(2)?.size)
+    register_slot(insn, consts, declared, insn.inputs.get(2)?.size)
 }
 
 /// The register a LOAD reads, on the same terms as [`register_store_target`].
@@ -126,13 +133,46 @@ pub(crate) fn register_store_target(
 pub(crate) fn register_load_source(
     insn: &rsleigh::Insn,
     consts: &PcodeConsts,
+    declared: &[rsleigh::Vn],
 ) -> Option<rsleigh::Vn> {
-    register_slot(insn, consts, insn.output.as_ref()?.size)
+    register_slot(insn, consts, declared, insn.output.as_ref()?.size)
 }
 
-fn register_slot(insn: &rsleigh::Insn, consts: &PcodeConsts, size: u32) -> Option<rsleigh::Vn> {
-    let space = crate::lift::pcode_util::decode_space_id(insn).ok()?;
-    if space != rsleigh::VnSpace::REGISTER {
+/// Whether `insn` addresses the REGISTER space at all, independent of whether
+/// the address resolves. What separates "this is an ordinary memory access"
+/// from "this is a register access this cannot name".
+pub(crate) fn is_register_space_access(insn: &rsleigh::Insn) -> bool {
+    crate::lift::pcode_util::decode_space_id(insn)
+        .is_ok_and(|space| space == rsleigh::VnSpace::REGISTER)
+}
+
+/// The folded address as the exact slice it names, gated on some DECLARED
+/// register enclosing it.
+///
+/// The gate is what keeps the tracked set a nesting family. A computed offset
+/// need not land on a declared boundary -- ARM's VLD4/VST4 single-lane forms
+/// omit the element-size scale, so the address is a raw byte offset into the
+/// register file -- and an offset that straddles two registers, or lands past
+/// the end of the file, names no register at all. Seeding such a slot puts a
+/// varnode that only PARTIALLY overlaps a real register into the tracked set,
+/// where `dedup_overlapping_largest` keeps both and models them as
+/// non-aliasing: a write to one is invisible to a read of the other.
+///
+/// The slice itself is returned, not its container, because the width is the
+/// access width -- [`enclosing_register`] is what the tracked set is seeded
+/// with, and `write_vn` reaches it from the slice through the container map.
+fn register_slot(
+    insn: &rsleigh::Insn,
+    consts: &PcodeConsts,
+    declared: &[rsleigh::Vn],
+    size: u32,
+) -> Option<rsleigh::Vn> {
+    let slot = raw_register_slot(insn, consts, size)?;
+    vn_container::smallest_enclosing(declared, &slot).map(|_| slot)
+}
+
+fn raw_register_slot(insn: &rsleigh::Insn, consts: &PcodeConsts, size: u32) -> Option<rsleigh::Vn> {
+    if !is_register_space_access(insn) {
         return None;
     }
     let off = u64::try_from(consts.value_of(insn.inputs.get(1)?)?).ok()?;
@@ -141,6 +181,34 @@ fn register_slot(insn: &rsleigh::Insn, consts: &PcodeConsts, size: u32) -> Optio
         addr_off: off,
         size,
     })
+}
+
+/// The declared register a resolved slot is a slice of. Seeded into the
+/// tracked set so the slot and every other view of that register share one SSA
+/// variable.
+pub(crate) fn enclosing_register(
+    declared: &[rsleigh::Vn],
+    slot: &rsleigh::Vn,
+) -> Option<rsleigh::Vn> {
+    vn_container::smallest_enclosing(declared, slot)
+}
+
+/// The tracked varnodes an UNRESOLVABLE register-space write may reach.
+///
+/// ponytail: the whole register file, because the address is unknown. Tighter
+/// would mean modelling the sla's own loop induction to bound the offsets a
+/// multi-structure VLD/VST walks -- the p-code carries a constant base, a
+/// constant stride and a constant trip count, so the reachable set is
+/// computable; it just is not computable from the per-region constant folder
+/// this shares with the def-site collector, which resets at every region
+/// boundary and so never sees the base and the use together.
+pub(crate) fn opaque_clobber_set(
+    all_vns: &[rsleigh::Vn],
+) -> impl Iterator<Item = rsleigh::Vn> + '_ {
+    all_vns
+        .iter()
+        .copied()
+        .filter(|v| v.addr_space == rsleigh::VnSpace::REGISTER)
 }
 
 #[cfg(test)]
